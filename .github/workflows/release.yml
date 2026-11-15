@@ -1,0 +1,79 @@
+name: Build and publish APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '扩展版本号，例如 1.4.5（最后一段必须递增）'
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-extension
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$VERSION" =~ ^1\.4\.[1-9][0-9]{0,8}$ ]]; then
+            echo "::error::版本号必须采用 1.4.N，例如 1.4.5"
+            exit 1
+          fi
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags" --jq '.[].name')
+          requested=${VERSION##*.}
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v1\.4\.([1-9][0-9]{0,8})$ ]] && (( BASH_REMATCH[1] >= requested )); then
+              echo "::error::版本必须大于已有标签 $tag"
+              exit 1
+            fi
+          done <<< "$tags"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare Android SDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
+
+      - name: Test, build and verify signed APK
+        shell: bash
+        env:
+          APK_KEYSTORE_BASE64: ${{ secrets.APK_KEYSTORE_BASE64 }}
+          APK_STORE_PASSWORD: ${{ secrets.APK_STORE_PASSWORD }}
+          APK_KEY_ALIAS: ${{ secrets.APK_KEY_ALIAS }}
+          APK_KEY_PASSWORD: ${{ secrets.APK_KEY_PASSWORD }}
+        run: |
+          : "${APK_KEYSTORE_BASE64:?Missing APK_KEYSTORE_BASE64}"
+          : "${APK_STORE_PASSWORD:?Missing APK_STORE_PASSWORD}"
+          : "${APK_KEY_ALIAS:?Missing APK_KEY_ALIAS}"
+          : "${APK_KEY_PASSWORD:?Missing APK_KEY_PASSWORD}"
+          umask 077
+          export APK_KEYSTORE_PATH="$RUNNER_TEMP/hikarinagi-release.keystore"
+          trap 'rm -f -- "$APK_KEYSTORE_PATH"' EXIT
+          printf '%s' "$APK_KEYSTORE_BASE64" | base64 --decode > "$APK_KEYSTORE_PATH"
+          bash ./gradlew --no-daemon -PextensionVersion="$VERSION" testDebugUnitTest assembleRelease
+          apk=build/outputs/apk/release/hikarinagi-mihon-extension-release.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify "$apk"
+          cp "$apk" "hikarinagi-v$VERSION.apk"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" "hikarinagi-v$VERSION.apk" \
+            --target "$GITHUB_SHA" --title "Hikarinagi v$VERSION" --generate-notes

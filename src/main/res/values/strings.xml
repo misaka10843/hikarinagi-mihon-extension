@@ -1,0 +1,4 @@
+<resources>
+    <!-- A real resource entry keeps resources.arsc readable by Suwayomi's apk-parser. -->
+    <string name="extension_label">Tachiyomi: Hikarinagi</string>
+</resources>
