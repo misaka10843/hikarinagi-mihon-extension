@@ -3,7 +3,7 @@ plugins {
     kotlin("android") version "2.1.21"
 }
 
-val releaseVersion = providers.gradleProperty("extensionVersion").orElse("1.4.4").get()
+val releaseVersion = providers.gradleProperty("extensionVersion").orElse("1.4.5").get()
 val releaseCode = Regex("""1\.4\.([1-9][0-9]{0,8})""").matchEntire(releaseVersion)
     ?.groupValues?.get(1)?.toInt() ?: error("extensionVersion 必须是 1.4.N，N 为正整数")
 val releaseKeystore = providers.environmentVariable("APK_KEYSTORE_PATH").orNull

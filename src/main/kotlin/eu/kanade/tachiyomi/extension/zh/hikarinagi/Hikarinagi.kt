@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.extension.zh.hikarinagi
 
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import androidx.preference.EditTextPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
@@ -40,20 +42,28 @@ class Hikarinagi : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val site = baseUrl.toHttpUrl()
         val jar = client.cookieJar
+        val status = EditTextPreference(screen.context).apply {
+            title = "Hikarinagi 登录状态"
+            summary = sessionSummary()
+            setEnabled(false)
+            dialogTitle = "Hikarinagi 登录状态"
+            dialogMessage = "此项仅显示状态。请在下方登录设置中导入或清除会话。"
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, _ -> false }
+        }
+        screen.addPreference(status)
         screen.addPreference(EditTextPreference(screen.context).apply {
             key = "hikarinagi_session_import"
             title = "Hikarinagi 登录 / 导入会话"
-            summary = sessionSummary()
+            summary = "导入官网 Cookie，或输入「清除」退出扩展会话。"
             dialogTitle = "导入 Hikarinagi 登录 Cookie"
-            dialogMessage = "粘贴官网 Cookie 导入会话。输入「验证」检查当前会话，输入「清除」退出。验证后重新打开设置查看结果。"
+            dialogMessage = "粘贴官网 Cookie 导入会话，输入「清除」退出。"
             setDefaultValue("")
             setOnPreferenceChangeListener { preference, input ->
                 val stored = suwayomiPreferences?.invoke(preference) as? SharedPreferences
                 stored?.edit()?.remove(preference.key)?.commit()
                 val value = input.toString().trim()
-                if (value == "验证") {
-                    verifySession()
-                } else if (value == "清除") {
+                if (value == "清除") {
                     val expired = jar.loadForRequest(site).filter { it.name in sessionCookieNames }.map {
                         it.newBuilder().expiresAt(0).build()
                     }
@@ -77,9 +87,12 @@ class Hikarinagi : HttpSource(), ConfigurableSource {
                         sessionCheck = null
                     }
                 }
+                status.summary = sessionSummary()
+                verifySession(status)
                 false
             }
         })
+        verifySession(status)
     }
 
     private fun sessionSummary(): String {
@@ -89,7 +102,7 @@ class Hikarinagi : HttpSource(), ConfigurableSource {
         } else {
             sessionCheck?.takeIf { it.fingerprint == fingerprint }?.message ?: "已保存会话，尚未验证"
         }
-        return "$status。粘贴 Cookie 导入，输入「验证」检查，输入「清除」退出。"
+        return status
     }
 
     private fun sessionFingerprint(): String? {
@@ -103,16 +116,31 @@ class Hikarinagi : HttpSource(), ConfigurableSource {
         )
     }
 
-    private fun verifySession() {
+    private fun verifySession(status: Preference) {
         val fingerprint = sessionFingerprint() ?: return
         val pending = SessionCheck(fingerprint, "正在验证")
-        if (sessionCheck == pending) return
-        sessionCheck = pending
+        synchronized(gate) {
+            val previous = sessionCheck
+            if (previous?.fingerprint == fingerprint &&
+                (previous.message == pending.message || System.nanoTime() - previous.checkedAt < 300_000_000_000L)
+            ) return
+            sessionCheck = pending
+        }
+        status.summary = pending.message
+        fun publish(result: String, current: String = fingerprint) {
+            synchronized(gate) {
+                if (sessionCheck !== pending) return
+                sessionCheck = SessionCheck(current, result)
+            }
+            runCatching { Looper.getMainLooper() }.getOrNull()?.let { looper ->
+                Handler(looper).post { status.summary = sessionSummary() }
+            }
+        }
         client.newCall(api("/user/me")).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 val result = if (e is RequestGate.SessionRejectedException) "官网拒绝会话，请重新登录"
                 else "暂时无法验证，请稍后重试"
-                if (sessionCheck === pending) sessionCheck = SessionCheck(fingerprint, result)
+                publish(result)
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -124,12 +152,16 @@ class Hikarinagi : HttpSource(), ConfigurableSource {
                     "官网未返回有效账号信息"
                 }
                 val current = sessionFingerprint()
-                if (sessionCheck === pending && current != null) sessionCheck = SessionCheck(current, result)
+                publish(result, current ?: fingerprint)
             }
         })
     }
 
-    private data class SessionCheck(val fingerprint: String, val message: String)
+    private data class SessionCheck(
+        val fingerprint: String,
+        val message: String,
+        val checkedAt: Long = System.nanoTime(),
+    )
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
